@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portal Data Pipeline – Operations Dashboard</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<style>
+  body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Devanagari",sans-serif}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Noto Sans Devanagari",monospace}
+  @keyframes pulse2{0%,100%{opacity:1}50%{opacity:.35}} .pulse2{animation:pulse2 1.4s infinite}
+  #console::-webkit-scrollbar{width:8px}#console::-webkit-scrollbar-thumb{background:#334155;border-radius:4px}
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen">
+
+<header class="bg-slate-900 text-white">
+  <div class="max-w-7xl mx-auto px-4 py-4 flex flex-wrap items-center gap-4 justify-between">
+    <div>
+      <h1 class="text-lg font-semibold tracking-tight">Portal Data Pipeline</h1>
+      <p class="text-xs text-slate-400">Shalby Hospitals · Corporate Credit Control · Live Operations Monitor</p>
+    </div>
+    <div class="flex items-center gap-3 text-sm">
+      <span id="live" class="flex items-center gap-2 text-slate-300"><span class="w-2 h-2 rounded-full bg-emerald-400 pulse2"></span><span id="liveTxt">Live</span></span>
+      <select id="runSel" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"></select>
+      <button id="pauseBtn" class="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 hover:bg-slate-700">Pause</button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+
+  <div id="alert" class="hidden rounded-lg border px-4 py-3 text-sm font-medium"></div>
+
+  <section class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4" id="kpis"></section>
+
+  <section class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+    <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Pipeline Stages</h2>
+    <div id="stages" class="grid grid-cols-2 md:grid-cols-6 gap-3"></div>
+  </section>
+
+  <section class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+    <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Hospital Units</h2>
+    <div id="units" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3"></div>
+    <p id="noUnits" class="text-sm text-slate-400 hidden">Unit activity will appear once conversion starts.</p>
+  </section>
+
+  <section class="bg-slate-900 rounded-xl shadow-sm overflow-hidden">
+    <div class="px-4 py-3 border-b border-slate-700 flex flex-wrap items-center gap-2">
+      <h2 class="text-sm font-semibold text-slate-200 mr-2">Execution Log (A → Z)</h2>
+      <div id="lvlChips" class="flex gap-1"></div>
+      <select id="stageF" class="bg-slate-800 text-slate-200 border border-slate-700 rounded px-2 py-1 text-xs"></select>
+      <select id="unitF" class="bg-slate-800 text-slate-200 border border-slate-700 rounded px-2 py-1 text-xs"></select>
+      <input id="q" placeholder="Search…" class="bg-slate-800 text-slate-200 border border-slate-700 rounded px-2 py-1 text-xs w-40">
+      <label class="ml-auto text-xs text-slate-300 flex items-center gap-1"><input id="auto" type="checkbox" checked> Auto-scroll</label>
+      <button id="csv" class="text-xs px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-200 hover:bg-slate-700">Export CSV</button>
+    </div>
+    <div id="console" class="mono text-xs h-[28rem] overflow-y-auto p-3 space-y-0.5"></div>
+  </section>
+
+  <p class="text-center text-xs text-slate-400">Auto-refreshes every 5 seconds · Stalled = no activity for 5+ minutes</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const STATUS = {
+  RUNNING:["bg-blue-100 text-blue-800","Running"], COMPLETED:["bg-emerald-100 text-emerald-800","Completed"],
+  FAILED:["bg-red-100 text-red-800","Failed"], STALLED:["bg-amber-100 text-amber-800","Stalled"]};
+const LVL = {ERROR:"text-red-400", WARN:"text-amber-300", SUCCESS:"text-emerald-400", INFO:"text-slate-300"};
+const STG = {pending:"border-slate-200 bg-slate-50 text-slate-400", active:"border-blue-300 bg-blue-50 text-blue-700",
+  done:"border-emerald-300 bg-emerald-50 text-emerald-700", error:"border-red-300 bg-red-50 text-red-700",
+  stalled:"border-amber-300 bg-amber-50 text-amber-700"};
+const ICON = {pending:"○", active:"◔", done:"✔", error:"✖", stalled:"⏸"};
+let paused = false, selRun = "", data = null, levels = new Set(["ERROR","WARN","SUCCESS","INFO"]);
+
+const fmtDur = s => { s = Math.max(0, s|0); const h=(s/3600)|0, m=((s%3600)/60)|0; return h? `${h}h ${m}m` : m? `${m}m ${s%60}s` : `${s}s`; };
+const fmtTime = iso => iso ? new Date(iso).toLocaleString("en-IN",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}) : "–";
+const runLabel = r => { const m = r.id.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/); return m ? `${m[3]}-${m[2]}-${m[1]} ${m[4]}:${m[5]}` : r.id; };
+
+function kpi(label, value, tone="text-slate-900", sub=""){
+  return `<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+    <p class="text-xs uppercase tracking-wide text-slate-500">${label}</p>
+    <p class="mt-1 text-2xl font-semibold ${tone}">${value}</p>
+    <p class="text-xs text-slate-400 mt-0.5">${sub}</p></div>`;
+}
+
+function render(){
+  const d = data; if(!d) return;
+  // run selector
+  $("runSel").innerHTML = d.runs.map(r => `<option value="${r.id}" ${r.id===d.run?.id?"selected":""}>${runLabel(r)} · ${STATUS[r.status][1]}</option>`).join("") || "<option>No runs yet</option>";
+  const r = d.run;
+  if(!r){ $("kpis").innerHTML = kpi("Status","No runs","text-slate-400","Start the pipeline in Colab"); return; }
+
+  // alert banner
+  const a = $("alert"); a.className = "rounded-lg border px-4 py-3 text-sm font-medium";
+  if(r.status==="STALLED"){ a.classList.add("bg-amber-50","border-amber-300","text-amber-800"); a.textContent = `⚠ No activity for ${fmtDur(r.idle_s)}. The pipeline may be stuck (last stage: ${d.stages.filter(s=>s.status==="stalled").map(s=>s.name).join(", ")||"–"}). Check the Colab session.`; }
+  else if(r.status==="FAILED"){ a.classList.add("bg-red-50","border-red-300","text-red-800"); a.textContent = "✖ Pipeline failed. See the last ERROR lines in the log below."; }
+  else if(r.errors>0){ a.classList.add("bg-red-50","border-red-300","text-red-800"); a.textContent = `✖ ${r.errors} error(s) recorded in this run. Review the highlighted log lines.`; }
+  else a.classList.add("hidden");
+
+  // KPIs
+  const [cls, txt] = STATUS[r.status];
+  $("kpis").innerHTML =
+    `<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4"><p class="text-xs uppercase tracking-wide text-slate-500">Status</p>
+      <span class="mt-2 inline-block px-3 py-1 rounded-full text-sm font-semibold ${cls} ${r.status==="RUNNING"?"pulse2":""}">${txt}</span></div>` +
+    kpi("Started", fmtTime(r.start).split(", ").pop(), "text-slate-900", fmtTime(r.start).split(", ")[0]) +
+    kpi("Duration", fmtDur(r.duration_s)) +
+    kpi("Log lines", r.count) +
+    kpi("Errors / Warnings", `<span class="${r.errors?"text-red-600":""}">${r.errors}</span> / <span class="${r.warns?"text-amber-600":""}">${r.warns}</span>`) +
+    kpi("Last activity", fmtDur(r.idle_s)+" ago", r.status==="STALLED"?"text-amber-600":"text-slate-900", fmtTime(r.last));
+
+  // stages
+  $("stages").innerHTML = d.stages.map((s,i)=>`<div class="rounded-lg border p-3 ${STG[s.status]}">
+    <div class="flex justify-between text-xs font-semibold"><span>${i+1}. ${s.name}</span><span class="${s.status==="active"?"pulse2":""}">${ICON[s.status]}</span></div>
+    <p class="text-[11px] mt-1 opacity-80">${s.logs} log lines</p></div>`).join("");
+
+  // units
+  $("noUnits").classList.toggle("hidden", d.units.length>0);
+  $("units").innerHTML = d.units.map(u=>{
+    const tone = {done:"border-emerald-300 bg-emerald-50",error:"border-red-300 bg-red-50",active:"border-blue-300 bg-blue-50",incomplete:"border-amber-300 bg-amber-50"}[u.status];
+    const badge = {done:"Done",error:"Error",active:"In progress",incomplete:"Incomplete"}[u.status];
+    return `<div class="rounded-lg border p-3 ${tone}"><div class="flex justify-between items-center"><span class="font-semibold text-sm">${esc(u.name)}</span>
+      <span class="text-[11px] font-medium">${badge}</span></div>
+      <p class="text-[11px] text-slate-500 mt-1">${u.stage||"–"} · ${u.errors} err · ${u.warns} warn</p>
+      <p class="text-[11px] text-slate-600 mt-1 truncate" title="${esc(u.last)}">${esc(u.last)}</p></div>`;
+  }).join("");
+
+  // filters
+  fillSel("stageF", ["All stages", ...d.stages.map(s=>s.name)]);
+  fillSel("unitF", ["All units", ...d.units.map(u=>u.name)]);
+  renderLogs();
+}
+
+function fillSel(id, opts){
+  const el=$(id), cur=el.value; if(el.options.length===opts.length && cur) return;
+  el.innerHTML = opts.map(o=>`<option>${esc(o)}</option>`).join(""); if(opts.includes(cur)) el.value=cur;
+}
+
+function filtered(){
+  const st=$("stageF").value, un=$("unitF").value, q=$("q").value.toLowerCase();
+  return data.logs.filter(l => levels.has(l.level) &&
+    (!st||st==="All stages"||l.stage===st) && (!un||un==="All units"||l.unit===un) &&
+    (!q || l.message.toLowerCase().includes(q)));
+}
+
+function renderLogs(){
+  const box=$("console"), nearEnd = box.scrollHeight-box.scrollTop-box.clientHeight < 60;
+  box.innerHTML = filtered().map(l=>`<div class="flex gap-2 ${l.level==="ERROR"?"bg-red-950/40":""}">
+    <span class="text-slate-500 shrink-0">${(l.ts||"").slice(11,19)}</span>
+    <span class="text-sky-400 shrink-0 w-20">${esc(l.stage)}</span>
+    <span class="text-violet-300 shrink-0 w-20 truncate">${esc(l.unit)}</span>
+    <span class="${LVL[l.level]||LVL.INFO} break-words">${esc(l.message)}</span></div>`).join("")
+    || `<p class="text-slate-500">No log lines match the filters.</p>`;
+  if($("auto").checked && nearEnd) box.scrollTop = box.scrollHeight;
+}
+
+$("lvlChips").innerHTML = ["ERROR","WARN","SUCCESS","INFO"].map(l=>
+  `<button data-l="${l}" class="chip text-[11px] px-2 py-0.5 rounded border border-slate-600 ${LVL[l]}">${l}</button>`).join("");
+document.querySelectorAll(".chip").forEach(b=>b.onclick=()=>{
+  const l=b.dataset.l; levels.has(l)?levels.delete(l):levels.add(l);
+  b.classList.toggle("opacity-30", !levels.has(l)); if(data) renderLogs(); });
+["stageF","unitF","q"].forEach(i=>$(i).addEventListener("input",()=>data&&renderLogs()));
+$("runSel").onchange = e => { selRun = e.target.value; load(); };
+$("pauseBtn").onclick = () => { paused=!paused; $("pauseBtn").textContent = paused?"Resume":"Pause"; $("liveTxt").textContent = paused?"Paused":"Live"; if(!paused) load(); };
+$("csv").onclick = () => {
+  const rows = [["time","stage","unit","level","message"], ...filtered().map(l=>[l.ts,l.stage,l.unit,l.level,l.message])];
+  const csv = rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob(["\ufeff"+csv],{type:"text/csv"}));
+  a.download = `pipeline-log-${data?.run?.id||"run"}.csv`; a.click();
+};
+
+async function load(){
+  try{
+    const res = await fetch("/api/state?run_id="+encodeURIComponent(selRun));
+    const j = await res.json();
+    if(j.error) throw new Error(j.error);
+    data = j; if(!selRun && j.run) selRun = j.run.id;
+    $("liveTxt").textContent = paused?"Paused":"Live · "+new Date().toLocaleTimeString("en-IN",{hour12:false});
+    render();
+  }catch(e){
+    const a=$("alert"); a.className="rounded-lg border px-4 py-3 text-sm font-medium bg-red-50 border-red-300 text-red-800";
+    a.textContent = "Dashboard cannot read the log sheet: "+e.message;
+  }
+}
+load(); setInterval(()=>{ if(!paused) load(); }, 5000);
+</script>
+</body>
+</html>
