@@ -60,7 +60,7 @@
     <div id="console" class="mono text-xs h-[28rem] overflow-y-auto p-3 space-y-0.5"></div>
   </section>
 
-  <p class="text-center text-xs text-slate-400">Auto-refreshes every 5 seconds · Stalled = no activity for 5+ minutes</p>
+  <p class="text-center text-xs text-slate-400">Auto-refreshes every 10 seconds · Stalled = no activity for 5+ minutes</p>
 </main>
 
 <script>
@@ -233,7 +233,7 @@ $("units").addEventListener("click", async ev=>{
   finally{ running=false; load(); }
 });
 window.addEventListener("beforeunload", e=>{ if(running){ e.preventDefault(); e.returnValue=""; } });
-load(); setInterval(()=>{ if(!paused) load(); }, 5000);
+load(); setInterval(()=>{ if(!paused && !document.hidden) load(); }, 10000);
 </script>
 </body>
 </html>

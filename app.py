@@ -53,15 +53,21 @@ STAGES = ["IMAP", "ZIP", "CONVERT", "TRANSFORM", "SHEET", "DONE"]
 COLS = ("run_id", "ts", "stage", "unit", "level", "message")
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "300"))   # इतनी देर कोई लॉग/हार्टबीट नहीं = STALLED
 TAIL_ROWS = int(os.environ.get("TAIL_ROWS", "4000"))          # शीट की आख़िरी इतनी पंक्तियाँ ही पढ़ना
-CACHE_TTL = 4                                                 # सेकंड (Google API कोटा बचाने के लिए)
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "8"))                                                # सेकंड (Google API कोटा बचाने के लिए)
 _cache = {"t": 0.0, "rows": []}
 
 
+_GC = None
+
+
 def _gc():
-    info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds)
+    global _GC
+    if _GC is None:
+        info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        creds = Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        _GC = gspread.authorize(creds)
+    return _GC
 
 
 def _worksheet():
@@ -69,20 +75,21 @@ def _worksheet():
 
 
 def load_rows(fresh=False):
+    """एक पोल = सिर्फ़ 1 Google Sheets रीड (वर्कशीट ऑब्जेक्ट कैश रहता है)"""
     if not fresh and time.time() - _cache["t"] < CACHE_TTL:
         return _cache["rows"]
     try:
         ws = _worksheet()
+        vals = ws.get("A2:F20000")
     except gspread.WorksheetNotFound:      # पाइपलाइन ने अभी तक 'logs' टैब बनाया नहीं
         _cache.update(t=time.time(), rows=[])
         return []
-    total = len(ws.col_values(1))
-    rows = []
-    if total >= 2:
-        start = max(2, total - TAIL_ROWS + 1)
-        for r in ws.get(f"A{start}:F{total}"):
-            if r:
-                rows.append(dict(zip(COLS, list(r) + [""] * (6 - len(r)))))
+    except Exception:
+        if _cache["rows"]:                 # कोटा/नेटवर्क दिक्कत: पुराना डेटा दिखाते रहो
+            _cache["t"] = time.time()
+            return _cache["rows"]
+        raise
+    rows = [dict(zip(COLS, list(r) + [""] * (6 - len(r)))) for r in vals if r][-TAIL_ROWS:]
     _cache.update(t=time.time(), rows=rows)
     return rows
 
@@ -503,24 +510,36 @@ class RunLog:
     def flush(self):
         if not self.buf:
             return
-        try:
-            _log_ws(create=True).append_rows(self.buf, value_input_option="RAW")
-            self.buf = []
-        except Exception as e:
-            print("log flush failed:", e)
+        global _LOGWS
+        for attempt in (1, 2):
+            try:
+                _log_ws(create=True).append_rows(self.buf, value_input_option="RAW")
+                self.buf = []
+                return
+            except Exception as e:
+                print("log flush failed:", e)
+                _LOGWS = None
+                if attempt == 1:
+                    time.sleep(6)
+
+
+_LOGWS = None
 
 
 def _log_ws(create=False):
+    global _LOGWS
+    if _LOGWS is not None:
+        return _LOGWS
     sh = _gc().open_by_key(os.environ["LOG_SHEET_ID"])
     tab = os.environ.get("LOG_TAB", "logs")
     try:
-        return sh.worksheet(tab)
+        _LOGWS = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         if not create:
             raise
-        ws = sh.add_worksheet(tab, rows=2000, cols=6)
-        ws.update(values=[LOG_HEADER], range_name="A1")
-        return ws
+        _LOGWS = sh.add_worksheet(tab, rows=2000, cols=6)
+        _LOGWS.update(values=[LOG_HEADER], range_name="A1")
+    return _LOGWS
 
 
 def _imap():
@@ -667,14 +686,12 @@ def process_unit(log, uid, zipname, member, unit_raw):
         raise ValueError(f"{unit_raw}: कोई शीट नहीं मिली")
     log.stage, log.unit = "CONVERT", unit
     log.log(f"🔄 {member} डाउनलोड/कन्वर्ट हो रही है")
-    log.flush()
     blob = fetch_member(uid, zipname, member)
     rows = xlsb_first_sheet(blob)
     log.log(f"✅ XLSB पढ़ी ({len(blob)//1024} KB, {max(len(rows)-1, 0)} पंक्तियाँ)", "SUCCESS")
     df = rows_to_df(rows)
 
     log.stage = "TRANSFORM"
-    log.flush()
     tdf = transform_dataframe(df)
     log.log(f"✅ {len(tdf)} पंक्तियाँ, {len(tdf.columns)} कॉलम ट्रांसफ़ॉर्म हुए "
             f"(OP: {(tdf['File Type'].astype(str).str.strip() == 'OP').sum()}, "
@@ -791,3 +808,4 @@ def state():
         return jsonify(error=f"Environment variable missing: {e}"), 500
     except Exception as e:
         return jsonify(error=f"{type(e).__name__}: {e}"), 500
+
