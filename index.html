@@ -23,6 +23,8 @@
     <div class="flex items-center gap-3 text-sm">
       <span id="live" class="flex items-center gap-2 text-slate-300"><span class="w-2 h-2 rounded-full bg-emerald-400 pulse2"></span><span id="liveTxt">Live</span></span>
       <select id="runSel" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"></select>
+      <span id="prog" class="text-xs text-sky-300 max-w-[14rem] truncate"></span>
+      <button id="runBtn" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 font-medium">▶ Run Pipeline</button>
       <button id="pauseBtn" class="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 hover:bg-slate-700">Pause</button>
     </div>
   </div>
@@ -90,11 +92,11 @@ function render(){
   // run selector
   $("runSel").innerHTML = d.runs.map(r => `<option value="${r.id}" ${r.id===d.run?.id?"selected":""}>${runLabel(r)} · ${STATUS[r.status][1]}</option>`).join("") || "<option>No runs yet</option>";
   const r = d.run;
-  if(!r){ $("kpis").innerHTML = kpi("Status","No runs","text-slate-400","Start the pipeline in Colab"); return; }
+  if(!r){ $("kpis").innerHTML = kpi("Status","No runs","text-slate-400","Click ‘Run Pipeline’ to start"); return; }
 
   // alert banner
   const a = $("alert"); a.className = "rounded-lg border px-4 py-3 text-sm font-medium";
-  if(r.status==="STALLED"){ a.classList.add("bg-amber-50","border-amber-300","text-amber-800"); a.textContent = `⚠ No activity for ${fmtDur(r.idle_s)}. The pipeline may be stuck (last stage: ${d.stages.filter(s=>s.status==="stalled").map(s=>s.name).join(", ")||"–"}). Check the Colab session.`; }
+  if(r.status==="STALLED"){ a.classList.add("bg-amber-50","border-amber-300","text-amber-800"); a.textContent = `⚠ No activity for ${fmtDur(r.idle_s)}. The pipeline may be stuck (last stage: ${d.stages.filter(s=>s.status==="stalled").map(s=>s.name).join(", ")||"–"}). Click ‘Run Pipeline’ again or retry the failed unit.`; }
   else if(r.status==="FAILED"){ a.classList.add("bg-red-50","border-red-300","text-red-800"); a.textContent = "✖ Pipeline failed. See the last ERROR lines in the log below."; }
   else if(r.errors>0){ a.classList.add("bg-red-50","border-red-300","text-red-800"); a.textContent = `✖ ${r.errors} error(s) recorded in this run. Review the highlighted log lines.`; }
   else a.classList.add("hidden");
@@ -123,7 +125,7 @@ function render(){
     return `<div class="rounded-lg border p-3 ${tone}"><div class="flex justify-between items-center"><span class="font-semibold text-sm">${esc(u.name)}</span>
       <span class="text-[11px] font-medium">${badge}</span></div>
       <p class="text-[11px] text-slate-500 mt-1">${u.stage||"–"} · ${u.errors} err · ${u.warns} warn</p>
-      <p class="text-[11px] text-slate-600 mt-1 truncate" title="${esc(u.last)}">${esc(u.last)}</p></div>`;
+      <p class="text-[11px] text-slate-600 mt-1 truncate" title="${esc(u.last)}">${esc(u.last)}</p>${u.status==="error"&&planByUnit[u.name]&&!running?`<button data-retry="${esc(u.name)}" class="mt-2 text-[11px] px-2 py-0.5 rounded bg-red-600 text-white hover:bg-red-500">Retry</button>`:""}</div>`;
   }).join("");
 
   // filters
@@ -183,6 +185,54 @@ async function load(){
     a.textContent = "Dashboard cannot read the log sheet: "+e.message;
   }
 }
+
+// ---------- Pipeline control (runs on Vercel) ----------
+let running = false, planByUnit = {}, pin = sessionStorage.getItem("pin") || "";
+const setProg = t => $("prog").textContent = t;
+async function api(path, body){
+  const r = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Run-Pin":pin},body:JSON.stringify(body||{})});
+  let j; try{ j = await r.json(); }catch(e){ throw Object.assign(new Error("No response (timeout/network, HTTP "+r.status+")"),{hard:true}); }
+  if(!r.ok) throw Object.assign(new Error(j.error||("HTTP "+r.status)),{status:r.status});
+  return j;
+}
+const badPin = e => { if(e.status===401||e.status===403){ sessionStorage.removeItem("pin"); pin=""; } };
+async function runPipeline(){
+  if(running) return;
+  if(!pin){ pin = prompt("Enter run PIN") || ""; if(!pin) return; sessionStorage.setItem("pin",pin); }
+  running = true; $("runBtn").disabled = true; $("runBtn").classList.add("opacity-50");
+  const hard=[]; let ok=0, fail=0, runId="";
+  try{
+    setProg("Starting…");
+    runId = (await api("/api/run/start")).run_id; selRun = runId; load();
+    setProg("Scanning mailbox…");
+    const {plan} = await api("/api/run/scan",{run_id:runId});
+    planByUnit = {}; plan.forEach(p=>{ if(p.unit) planByUnit[p.unit]=p; });
+    const todo = plan.filter(p=>p.unit);
+    for(let i=0;i<todo.length;i++){
+      const p = todo[i]; setProg(`Unit ${i+1}/${todo.length}: ${p.unit}`);
+      try{ await api("/api/run/unit",{run_id:runId,...p}); ok++; }
+      catch(e){ fail++; if(e.hard) hard.push(p.unit); badPin(e); }
+      load();
+    }
+    await api("/api/run/finish",{run_id:runId, ok, fail, hard});
+    setProg(`Finished: ${ok} ok, ${fail} failed`);
+  }catch(e){
+    setProg("Stopped: "+e.message); badPin(e);
+    if(runId) try{ await api("/api/run/finish",{run_id:runId, ok, fail, hard, fatal:e.message}); }catch(_){}
+  }finally{
+    running=false; $("runBtn").disabled=false; $("runBtn").classList.remove("opacity-50"); load();
+  }
+}
+$("runBtn").onclick = runPipeline;
+$("units").addEventListener("click", async ev=>{
+  const b = ev.target.closest("[data-retry]"); if(!b||running) return;
+  const p = planByUnit[b.dataset.retry]; if(!p||!selRun) return;
+  running = true; setProg("Retrying "+p.unit+"…");
+  try{ await api("/api/run/unit",{run_id:selRun,...p}); setProg("Retry OK: "+p.unit); }
+  catch(e){ setProg("Retry failed: "+e.message); badPin(e); }
+  finally{ running=false; load(); }
+});
+window.addEventListener("beforeunload", e=>{ if(running){ e.preventDefault(); e.returnValue=""; } });
 load(); setInterval(()=>{ if(!paused) load(); }, 5000);
 </script>
 </body>

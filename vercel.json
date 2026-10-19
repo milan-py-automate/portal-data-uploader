@@ -1,4 +1,3 @@
 {
-  "builds": [{ "src": "app.py", "use": "@vercel/python", "config": { "includeFiles": ["index.html"] } }],
-  "routes": [{ "src": "/(.*)", "dest": "app.py" }]
+  "functions": { "app.py": { "maxDuration": 60, "includeFiles": "index.html" } }
 }

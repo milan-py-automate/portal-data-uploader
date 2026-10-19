@@ -1,3 +1,5 @@
 flask>=3.0
 gspread>=6.0
 google-auth>=2.29
+imapclient>=3.0
+pandas>=2.1
