@@ -6,6 +6,7 @@ import time
 import hmac
 import email
 import struct
+import xml.etree.ElementTree as ET
 import zipfile
 import warnings
 from email.header import decode_header
@@ -790,4 +791,3 @@ def state():
         return jsonify(error=f"Environment variable missing: {e}"), 500
     except Exception as e:
         return jsonify(error=f"{type(e).__name__}: {e}"), 500
-
